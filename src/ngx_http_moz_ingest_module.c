@@ -226,6 +226,7 @@ static void* ngx_http_moz_ingest_create_loc_conf(ngx_conf_t *cf)
   conf->batch_size        = NGX_CONF_UNSET_SIZE;
   conf->max_buffer_ms     = NGX_CONF_UNSET_MSEC;
   // everything else is properly initialized by pcalloc
+  return conf;
 }
 
 
@@ -324,7 +325,7 @@ ngx_http_moz_ingest_init_kafka(ngx_http_request_t *r,
 
   char brokerlist[conf->brokerlist.len + 1];
   memcpy(brokerlist, conf->brokerlist.data, conf->brokerlist.len + 1);
-  if (rd_kafka_brokers_add(conf->rk, conf->brokerlist.data) == 0) {
+  if (rd_kafka_brokers_add(conf->rk, (const char *)conf->brokerlist.data) == 0) {
     rd_kafka_destroy(conf->rk);
     conf->rk = NULL;
     ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
@@ -409,8 +410,8 @@ static lsb_err_value write_str_field(lsb_output_buffer *ob,
   lsb_pb_write_key(ob, LSB_PB_FIELDS, LSB_PB_WT_LENGTH);
   size_t len_pos = ob->pos;
   lsb_pb_write_varint(ob, 0);  // length tbd later
-  lsb_pb_write_string(ob, LSB_PB_NAME, key, klen);
-  lsb_pb_write_string(ob, LSB_PB_VALUE_STRING, value, vlen);
+  lsb_pb_write_string(ob, LSB_PB_NAME, (char *)key, klen);
+  lsb_pb_write_string(ob, LSB_PB_VALUE_STRING, (char *)value, vlen);
   return lsb_pb_update_field_length(ob, len_pos);
 }
 
@@ -430,7 +431,6 @@ static lsb_err_value write_content_field(lsb_output_buffer *ob,
   ev = lsb_pb_write_varint(ob, LSB_PB_BYTES);
 
   if (NULL == r->request_body->temp_file) {
-    ngx_buf_t *buf;
     ngx_chain_t *cl;
     cl = r->request_body->bufs;
     for (bool first = true; cl && !ev; cl = cl->next) {
@@ -439,7 +439,7 @@ static lsb_err_value write_content_field(lsb_output_buffer *ob,
         lsb_pb_write_key(ob, LSB_PB_VALUE_BYTES, LSB_PB_WT_LENGTH);
         lsb_outputs(ob, vint, vlen);
       }
-      ev = lsb_outputs(ob, cl->buf->pos, cl->buf->last - cl->buf->pos);
+      ev = lsb_outputs(ob, (char *)cl->buf->pos, cl->buf->last - cl->buf->pos);
     }
   } else {
     size_t ret;
@@ -447,7 +447,7 @@ static lsb_err_value write_content_field(lsb_output_buffer *ob,
     unsigned char data[4096];
     while ((ret = ngx_read_file(&r->request_body->temp_file->file, data, 4096,
                                 offset)) > 0 && !ev) {
-      ev = lsb_outputs(ob, data, ret);
+      ev = lsb_outputs(ob, (char *)data, ret);
       offset = offset + ret;
     }
   }
@@ -484,26 +484,29 @@ ngx_http_moz_ingest_body_handler(ngx_http_request_t *r)
   lsb_pb_write_key(&ob, LSB_PB_TIMESTAMP, LSB_PB_WT_VARINT);
   lsb_pb_write_varint(&ob, ns);
 
-  lsb_pb_write_string(&ob, LSB_PB_TYPE, "moz_ingest", 10);
+  lsb_pb_write_string(&ob, LSB_PB_LOGGER, "moz_ingest", 10);
 
-  lsb_pb_write_string(&ob, LSB_PB_HOSTNAME, ngx_cycle->hostname.data,
+  lsb_pb_write_string(&ob, LSB_PB_TYPE, (char *)conf->topic.data,
+                      conf->topic.len);
+
+  lsb_pb_write_string(&ob, LSB_PB_HOSTNAME, (char *)ngx_cycle->hostname.data,
                       ngx_cycle->hostname.len);
 
   if (conf->client_ip) {
-    write_str_field(&ob, "remote_addr", 11, r->connection->addr_text.data,
+    write_str_field(&ob, (u_char *)"remote_addr", 11, r->connection->addr_text.data,
                     r->connection->addr_text.len);
   }
-  write_str_field(&ob, "uri", 3, r->uri.data, r->uri.len);
+  write_str_field(&ob, (u_char *)"uri", 3, r->uri.data, r->uri.len);
   if (r->args.len) {
-    write_str_field(&ob, "args", 4, r->args.data, r->args.len);
+    write_str_field(&ob, (u_char *)"args", 4, r->args.data, r->args.len);
   }
-  ev = write_str_field(&ob, "protocol", 8, r->http_protocol.data,
+  ev = write_str_field(&ob, (u_char *)"protocol", 8, r->http_protocol.data,
                        r->http_protocol.len);
 
   if (conf->headers != NGX_CONF_UNSET_PTR) {
     ngx_str_t *hdr = conf->headers->elts;
     ngx_table_elt_t *e;
-    for (int i = 0; i < conf->headers->nelts && !ev; ++i) {
+    for (ngx_uint_t i = 0; i < conf->headers->nelts && !ev; ++i) {
       if (h_content_length.len == hdr[i].len &&
           ngx_strcasecmp(h_content_length.data, hdr[i].data) == 0) {
         e = r->headers_in.content_length;
