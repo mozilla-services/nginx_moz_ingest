@@ -270,6 +270,7 @@ ngx_http_moz_ingest_init_kafka(ngx_http_request_t *r,
   char errstr[512];
   char value[21];
   rd_kafka_conf_res_t rv;
+  /*
   rv = rd_kafka_conf_set(kconf, "delivery.report.no.poll", "true", errstr,
                          sizeof errstr);
   if (rv) {
@@ -278,6 +279,7 @@ ngx_http_moz_ingest_init_kafka(ngx_http_request_t *r,
                   "rd_kafka_conf_set failed: %s", errstr);
     return false;
   }
+  */
   if (conf->max_buffer_size != NGX_CONF_UNSET_SIZE) {
     snprintf(value, sizeof value, "%zu", conf->max_buffer_size);
     rv = rd_kafka_conf_set(kconf, "queue.buffering.max.messages", value, errstr,
@@ -428,25 +430,23 @@ static lsb_err_value write_content_field(lsb_output_buffer *ob,
   lsb_pb_write_varint(ob, 9 + 2 + 1 + vlen + clen);
   lsb_pb_write_string(ob, LSB_PB_NAME, "content", 7);
   lsb_pb_write_key(ob, LSB_PB_VALUE_TYPE, LSB_PB_WT_VARINT);
-  ev = lsb_pb_write_varint(ob, LSB_PB_BYTES);
+  lsb_pb_write_varint(ob, LSB_PB_BYTES);
+  lsb_pb_write_key(ob, LSB_PB_VALUE_BYTES, LSB_PB_WT_LENGTH);
+  ev = lsb_outputs(ob, vint, vlen);
 
   if (NULL == r->request_body->temp_file) {
     ngx_chain_t *cl;
     cl = r->request_body->bufs;
-    for (bool first = true; cl && !ev; cl = cl->next) {
-      if (first) {
-        first = false;
-        lsb_pb_write_key(ob, LSB_PB_VALUE_BYTES, LSB_PB_WT_LENGTH);
-        lsb_outputs(ob, vint, vlen);
-      }
+    for (; cl && !ev; cl = cl->next) {
       ev = lsb_outputs(ob, (char *)cl->buf->pos, cl->buf->last - cl->buf->pos);
     }
   } else {
     size_t ret;
     size_t offset = 0;
     unsigned char data[4096];
-    while ((ret = ngx_read_file(&r->request_body->temp_file->file, data, 4096,
-                                offset)) > 0 && !ev) {
+    while (!ev &&
+           (ret = ngx_read_file(&r->request_body->temp_file->file, data, 4096,
+                                offset)) > 0) {
       ev = lsb_outputs(ob, (char *)data, ret);
       offset = offset + ret;
     }
@@ -608,6 +608,7 @@ ngx_http_moz_ingest(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
       ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
   clcf->handler = ngx_http_moz_ingest_handler;
 
+  /*
   rd_kafka_conf_t *kconf = rd_kafka_conf_new();
   if (!kconf) {
     ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "rd_kafka_conf_new failed");
@@ -623,5 +624,6 @@ ngx_http_moz_ingest(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return NGX_CONF_ERROR;
   }
   rd_kafka_conf_destroy(kconf);
+  */
   return NGX_CONF_OK;
 }

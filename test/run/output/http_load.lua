@@ -3,7 +3,7 @@
 -- file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 require "coroutine"
-require "socket"
+local socket = require "socket"
 require "string"
 require "table"
 
