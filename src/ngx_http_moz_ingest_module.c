@@ -10,6 +10,7 @@
 #include <luasandbox/util/output_buffer.h>
 #include <luasandbox/util/protobuf.h>
 #include <ngx_http.h>
+#include <stdio.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <time.h>
@@ -19,9 +20,13 @@ static void* ngx_http_moz_ingest_create_loc_conf(ngx_conf_t *cf);
 static char* ngx_http_moz_ingest_merge_loc_conf(ngx_conf_t *cf,
                                                 void *parent,
                                                 void *child);
-static ngx_int_t ngx_http_moz_ingest_handler(ngx_http_request_t *r);
+static ngx_int_t ngx_http_moz_ingest_post_conf(ngx_conf_t *cf);
+
+static ngx_int_t ngx_http_moz_ingest_init_process(ngx_cycle_t *cycle);
 static void  ngx_http_moz_ingest_exit_process(ngx_cycle_t *cycle);
 static void  ngx_http_moz_ingest_exit_master(ngx_cycle_t *cycle);
+
+static ngx_int_t ngx_http_moz_ingest_handler(ngx_http_request_t *r);
 static char* ngx_http_moz_ingest(ngx_conf_t *cf, ngx_command_t *cmd,
                                  void *conf);
 
@@ -98,13 +103,34 @@ static ngx_command_t ngx_http_moz_ingest_cmds[] = {
     offsetof(ngx_http_moz_ingest_loc_conf_t, topic),
     NULL },
 
+  { ngx_string("moz_ingest_landfill_dir"),
+    NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+    ngx_conf_set_str_slot,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    offsetof(ngx_http_moz_ingest_loc_conf_t, landfill_dir),
+    NULL },
+
+  { ngx_string("moz_ingest_landfill_roll_size"),
+    NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+    ngx_conf_set_size_slot,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    offsetof(ngx_http_moz_ingest_loc_conf_t, landfill_roll_size),
+    NULL },
+
+  { ngx_string("moz_ingest_landfill_name"),
+    NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+    ngx_conf_set_str_slot,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    offsetof(ngx_http_moz_ingest_loc_conf_t, landfill_name),
+    NULL },
+
   ngx_null_command
 };
 
 
 static ngx_http_module_t ngx_http_moz_ingest_module_ctx = {
   NULL,    /* preconfiguration */
-  NULL,    /* postconfiguration */
+  ngx_http_moz_ingest_post_conf,    /* verify the conditional config options */
   ngx_http_moz_ingest_create_main_conf,
   NULL,    /* merge_main_conf */
   NULL,    /* create_srv_conf */
@@ -121,13 +147,93 @@ ngx_module_t ngx_http_moz_ingest_module = {
   NGX_HTTP_MODULE,                  /* module type */
   NULL,    /* init master */
   NULL,    /* init module */
-  NULL,    /* init process */
+  ngx_http_moz_ingest_init_process,    /* setup the kafka producers/topics and landfill if necessary */
   NULL,    /* init thread */
   NULL,    /* exit thread */
-  ngx_http_moz_ingest_exit_process,   /* clean up kafka producers/topics */
+  ngx_http_moz_ingest_exit_process,   /* clean up kafka producers/topics and landfill if necessary */
   ngx_http_moz_ingest_exit_master,    /* release the Kafka lib resources */
   NGX_MODULE_V1_PADDING
 };
+
+
+static void* ngx_http_moz_ingest_create_main_conf(ngx_conf_t *cf)
+{
+  ngx_http_moz_ingest_main_conf_t *conf;
+
+  conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_moz_ingest_main_conf_t));
+  if (conf == NULL) {
+    return NULL;
+  }
+  return conf;
+}
+
+
+static void* ngx_http_moz_ingest_create_loc_conf(ngx_conf_t *cf)
+{
+  ngx_http_moz_ingest_loc_conf_t *conf =
+      ngx_pcalloc(cf->pool, sizeof(ngx_http_moz_ingest_loc_conf_t));
+  if (conf == NULL) return NULL;
+
+  conf->max_content_size      = NGX_CONF_UNSET_SIZE;
+  conf->max_unparsed_uri_size = NGX_CONF_UNSET_SIZE;
+  conf->client_ip             = NGX_CONF_UNSET;
+  conf->headers               = NGX_CONF_UNSET_PTR;
+
+  conf->max_buffer_size       = NGX_CONF_UNSET_SIZE;
+  conf->batch_size            = NGX_CONF_UNSET_SIZE;
+  conf->landfill_roll_size    = NGX_CONF_UNSET_SIZE;
+  conf->max_buffer_ms         = NGX_CONF_UNSET_MSEC;
+  // everything else is properly initialized by pcalloc
+  return conf;
+}
+
+
+static char*
+ngx_http_moz_ingest_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
+{
+  ngx_http_moz_ingest_loc_conf_t *prev = parent;
+  ngx_http_moz_ingest_loc_conf_t *conf = child;
+  ngx_conf_merge_size_value(conf->max_content_size, prev->max_content_size,
+                            1024 * 100);
+  ngx_conf_merge_size_value(conf->max_unparsed_uri_size,
+                            prev->max_unparsed_uri_size, 256);
+  ngx_conf_merge_value(conf->client_ip, prev->client_ip, 1);
+  ngx_conf_merge_ptr_value(conf->headers, prev->headers, NGX_CONF_UNSET_PTR);
+
+  ngx_conf_merge_size_value(conf->max_buffer_size, prev->max_buffer_size,
+                            NGX_CONF_UNSET_SIZE);
+  ngx_conf_merge_msec_value(conf->max_buffer_ms, prev->max_buffer_ms,
+                            NGX_CONF_UNSET_MSEC);
+  ngx_conf_merge_size_value(conf->batch_size, prev->batch_size,
+                            NGX_CONF_UNSET_SIZE);
+  ngx_conf_merge_size_value(conf->landfill_roll_size, prev->landfill_roll_size,
+                            1024 * 1024 * 300);
+  ngx_conf_merge_str_value(conf->brokerlist, prev->brokerlist, "");
+  ngx_conf_merge_str_value(conf->topic, prev->topic, "");
+  ngx_conf_merge_str_value(conf->landfill_dir, prev->landfill_dir, "");
+  ngx_conf_merge_str_value(conf->landfill_name, prev->landfill_name, "");
+  return NGX_CONF_OK;
+}
+
+
+static ngx_int_t ngx_http_moz_ingest_post_conf(ngx_conf_t *cf)
+{
+  ngx_http_moz_ingest_main_conf_t *mc =
+      ngx_http_conf_get_module_main_conf(cf, ngx_http_moz_ingest_module);
+
+  if (!mc->confs) return NGX_OK;
+
+  for (size_t i = 0; i < mc->confs_size; ++i) {
+    ngx_http_moz_ingest_loc_conf_t *conf = mc->confs[i];
+    if (conf->landfill_dir.len) {
+      if (!conf->landfill_name.len) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "moz_ingest_landfill_name must be set");
+        return NGX_ERROR;
+      }
+    }
+  }
+  return NGX_OK;
+}
 
 
 /* todo add delivery confirmation, this callback cannot be used to safely
@@ -166,214 +272,217 @@ static void msg_delivered(rd_kafka_t *rk,
 */
 
 
+static void get_landfill_name(ngx_http_moz_ingest_loc_conf_t *conf,
+                              landfill_file *lff,
+                              char *buf,
+                              size_t len)
+{
+  ngx_tm_t tm;
+  ngx_gmtime(lff->t, &tm);
+  u_char *end = ngx_snprintf((u_char *)buf, len - 1,
+                             "%V/%V%s+%4d%02d%02d%02d%02d%02d.%d_%V_%P",
+                             &conf->landfill_dir,
+                             &conf->landfill_name,
+                             lff == &conf->lfother ? "_other" : "",
+                             tm.ngx_tm_year, tm.ngx_tm_mon, tm.ngx_tm_mday,
+                             tm.ngx_tm_hour, tm.ngx_tm_min, tm.ngx_tm_sec,
+                             lff->cnt,
+                             &ngx_cycle->hostname,
+                             ngx_getpid());
+  *end = 0;
+}
+
+
+static bool open_landfill_log(ngx_http_moz_ingest_loc_conf_t *conf, landfill_file *lff)
+{
+  if (lff->fh) return true;
+
+  time_t t = time(NULL);
+  if (t == lff->t) {
+    lff->cnt += 1;
+  } else {
+    lff->cnt = 0;
+  }
+  lff->t = t;
+  char fn[256];
+  get_landfill_name(conf, lff, fn, sizeof(fn));
+  lff->fh = fopen(fn, "w");
+  return lff->fh ? true : false;
+}
+
+
+static bool roll_landfill_log(ngx_http_moz_ingest_loc_conf_t *conf, landfill_file *lff)
+{
+  if (lff->fh) {
+    long len = ftell(lff->fh);
+    if (len >= (long)conf->landfill_roll_size) {
+      fclose(lff->fh);
+      lff->fh = NULL;
+
+      char fn[256];
+      get_landfill_name(conf, lff, fn, sizeof(fn));
+
+      if (len > 0) {
+        char done[261];
+        snprintf(done, sizeof(done), "%s.done", fn);
+        rename(fn, done);
+      } else { // clean up empty files on shutdown
+        remove(fn);
+      }
+      return true;
+    }
+  } else {
+    return true;
+  }
+  return false;
+}
+
+
+static ngx_int_t ngx_http_moz_ingest_init_process(ngx_cycle_t *cycle)
+{
+  ngx_http_moz_ingest_main_conf_t *mc =
+      ngx_http_cycle_get_module_main_conf(cycle, ngx_http_moz_ingest_module);
+
+  if (!mc->confs) return NGX_OK;
+
+  for (size_t i = 0; i < mc->confs_size; ++i) {
+    ngx_http_moz_ingest_loc_conf_t *conf = mc->confs[i];
+    rd_kafka_conf_t *kconf = rd_kafka_conf_new();
+    if (!kconf) {
+      ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "rd_kafka_conf_new failed");
+      return NGX_ERROR;
+    }
+    char errstr[512];
+    char value[21];
+    rd_kafka_conf_res_t rv;
+    /*
+    rv = rd_kafka_conf_set(kconf, "delivery.report.no.poll", "true", errstr, sizeof errstr);
+    if (rv) {
+      rd_kafka_conf_destroy(kconf);
+      ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "rd_kafka_conf_set failed: %s", errstr);
+      return NGX_ERROR;
+    }
+    */
+    if (conf->max_buffer_size != NGX_CONF_UNSET_SIZE) {
+      snprintf(value, sizeof value, "%zu", conf->max_buffer_size);
+      rv = rd_kafka_conf_set(kconf, "queue.buffering.max.messages", value, errstr, sizeof errstr);
+      if (rv) {
+        rd_kafka_conf_destroy(kconf);
+        ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "rd_kafka_conf_set failed: %s", errstr);
+        return NGX_ERROR;
+      }
+    }
+    if (conf->max_buffer_ms != NGX_CONF_UNSET_MSEC) {
+      snprintf(value, sizeof value, "%zu", conf->max_buffer_ms / 1000);
+      rv = rd_kafka_conf_set(kconf, "queue.buffering.max.ms", value, errstr, sizeof errstr);
+      if (rv) {
+        rd_kafka_conf_destroy(kconf);
+        ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "rd_kafka_conf_set failed: %s", errstr);
+        return NGX_ERROR;
+      }
+    }
+    if (conf->batch_size != NGX_CONF_UNSET_SIZE) {
+      snprintf(value, sizeof value, "%zu", conf->batch_size);
+      rv = rd_kafka_conf_set(kconf, "batch.num.messages", value, errstr, sizeof errstr);
+      if (rv) {
+        rd_kafka_conf_destroy(kconf);
+        ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "rd_kafka_conf_set failed: %s", errstr);
+        return NGX_ERROR;
+      }
+    }
+
+    // rd_kafka_conf_set_dr_msg_cb(kconf, msg_delivered);
+    rd_kafka_conf_set_dr_msg_cb(kconf, NULL); // disable the callback for now
+    rd_kafka_conf_set_log_cb(kconf, NULL); // disable logging
+
+    conf->rk = rd_kafka_new(RD_KAFKA_PRODUCER, kconf, errstr, sizeof errstr);
+    if (!conf->rk) {
+      rd_kafka_conf_destroy(kconf); // the producer has not taken ownership
+      ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "Failed to create a Kafka producer: %s", errstr);
+      return NGX_ERROR;
+    }
+
+    char brokerlist[conf->brokerlist.len + 1];
+    memcpy(brokerlist, conf->brokerlist.data, conf->brokerlist.len + 1);
+    if (rd_kafka_brokers_add(conf->rk, (const char *)conf->brokerlist.data) == 0) {
+      rd_kafka_destroy(conf->rk);
+      conf->rk = NULL;
+      ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "No valid brokers specified");
+      return NGX_ERROR;
+    }
+
+    char topic[conf->topic.len + 1];
+    memcpy(topic, conf->topic.data, conf->topic.len + 1);
+    rd_kafka_topic_conf_t *tconf = rd_kafka_topic_conf_new();
+    if (!tconf) {
+      ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "rd_kafka_topic_conf_new failed");
+      return NGX_ERROR;
+    }
+    conf->rkt = rd_kafka_topic_new(conf->rk, topic, tconf);
+    if (!conf->rkt) {
+      rd_kafka_topic_conf_destroy(tconf);
+      rd_kafka_destroy(conf->rk);
+      conf->rk = NULL;
+      ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "Failed to create a Kafka topic: %s", errstr);
+      return NGX_ERROR;
+    }
+
+    if (conf->landfill_dir.len) {
+      if (!open_landfill_log(conf, &conf->lfmain)) {
+        ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "unable to open landfill");
+        return NGX_ERROR;
+      }
+      if (!open_landfill_log(conf, &conf->lfother)) {
+        ngx_log_error(NGX_LOG_ERR, cycle->log, 0, "unable to open landfill_other");
+        return NGX_ERROR;
+      }
+    }
+  }
+  return NGX_OK;
+}
+
+
 static void ngx_http_moz_ingest_exit_process(ngx_cycle_t *cycle)
 {
   ngx_http_moz_ingest_main_conf_t *mc =
       ngx_http_cycle_get_module_main_conf(cycle, ngx_http_moz_ingest_module);
 
-  if (mc->topics) {
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, cycle->log, 0, "freeing %zu topics\n",
-                   mc->topics_size);
-    for (size_t i = 0; i < mc->topics_size; ++i) {
-      rd_kafka_topic_destroy(mc->topics[i]);
+  if (!mc->confs) return;
+
+  for (size_t i = 0; i < mc->confs_size; ++i) {
+    ngx_http_moz_ingest_loc_conf_t *conf = mc->confs[i];
+
+    if (conf->rkt) {
+      rd_kafka_topic_destroy(conf->rkt);
     }
-    free(mc->topics);
-    mc->topics = NULL;
+
+    if (conf->rk) {
+      rd_kafka_destroy(conf->rk);
+    }
+
+    conf->landfill_roll_size = 0;
+    roll_landfill_log(conf, &conf->lfmain);
+    roll_landfill_log(conf, &conf->lfother);
   }
 
-  if (mc->producers) {
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, cycle->log, 0, "freeing %zu producers\n",
-                   mc->producers_size);
-    for (size_t i = 0; i < mc->producers_size; ++i) {
-      rd_kafka_destroy(mc->producers[i]);
-    }
-    free(mc->producers);
-    mc->producers = NULL;
-  }
+  free(mc->confs);
+  mc->confs = NULL;
+  mc->confs_size = 0;
 }
 
 
 static void ngx_http_moz_ingest_exit_master(ngx_cycle_t *cycle)
 {
-  rd_kafka_wait_destroyed(1000);
-}
-
-
-static void* ngx_http_moz_ingest_create_main_conf(ngx_conf_t *cf)
-{
-  ngx_http_moz_ingest_main_conf_t *conf;
-
-  conf = ngx_pcalloc(cf->pool, sizeof(ngx_http_moz_ingest_main_conf_t));
-  if (conf == NULL) {
-    return NULL;
-  }
-  return conf;
-}
-
-
-static void* ngx_http_moz_ingest_create_loc_conf(ngx_conf_t *cf)
-{
-  ngx_http_moz_ingest_loc_conf_t *conf =
-      ngx_pcalloc(cf->pool, sizeof(ngx_http_moz_ingest_loc_conf_t));
-  if (conf == NULL) return NULL;
-
-  conf->max_content_size      = NGX_CONF_UNSET_SIZE;
-  conf->max_unparsed_uri_size = NGX_CONF_UNSET_SIZE;
-  conf->client_ip             = NGX_CONF_UNSET;
-  conf->headers               = NGX_CONF_UNSET_PTR;
-
-  conf->max_buffer_size   = NGX_CONF_UNSET_SIZE;
-  conf->batch_size        = NGX_CONF_UNSET_SIZE;
-  conf->max_buffer_ms     = NGX_CONF_UNSET_MSEC;
-  // everything else is properly initialized by pcalloc
-  return conf;
-}
-
-
-static char*
-ngx_http_moz_ingest_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
-{
-  ngx_http_moz_ingest_loc_conf_t *prev = parent;
-  ngx_http_moz_ingest_loc_conf_t *conf = child;
-  ngx_conf_merge_size_value(conf->max_content_size, prev->max_content_size,
-                            1024 * 100);
-  ngx_conf_merge_size_value(conf->max_unparsed_uri_size,
-                            prev->max_unparsed_uri_size, 256);
-  ngx_conf_merge_value(conf->client_ip, prev->client_ip, 1);
-  ngx_conf_merge_ptr_value(conf->headers, prev->headers, NGX_CONF_UNSET_PTR);
-
-  ngx_conf_merge_size_value(conf->max_buffer_size, prev->max_buffer_size,
-                            NGX_CONF_UNSET_SIZE);
-  ngx_conf_merge_msec_value(conf->max_buffer_ms, prev->max_buffer_ms,
-                            NGX_CONF_UNSET_MSEC);
-  ngx_conf_merge_size_value(conf->batch_size, prev->batch_size,
-                            NGX_CONF_UNSET_SIZE);
-  ngx_conf_merge_str_value(conf->brokerlist, prev->brokerlist, "");
-  ngx_conf_merge_str_value(conf->topic, prev->topic, "");
-  return NGX_CONF_OK;
-}
-
-
-static bool
-ngx_http_moz_ingest_init_kafka(ngx_http_request_t *r,
-                               ngx_http_moz_ingest_loc_conf_t *conf)
-{
   ngx_http_moz_ingest_main_conf_t *mc =
-      ngx_http_get_module_main_conf(r, ngx_http_moz_ingest_module);
+      ngx_http_cycle_get_module_main_conf(cycle, ngx_http_moz_ingest_module);
 
-  rd_kafka_conf_t *kconf = rd_kafka_conf_new();
-  if (!kconf) {
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                  "rd_kafka_conf_new failed");
-    return false;
-  }
-  char errstr[512];
-  char value[21];
-  rd_kafka_conf_res_t rv;
-  /*
-  rv = rd_kafka_conf_set(kconf, "delivery.report.no.poll", "true", errstr,
-                         sizeof errstr);
-  if (rv) {
-    rd_kafka_conf_destroy(kconf);
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                  "rd_kafka_conf_set failed: %s", errstr);
-    return false;
-  }
-  */
-  if (conf->max_buffer_size != NGX_CONF_UNSET_SIZE) {
-    snprintf(value, sizeof value, "%zu", conf->max_buffer_size);
-    rv = rd_kafka_conf_set(kconf, "queue.buffering.max.messages", value, errstr,
-                           sizeof errstr);
-    if (rv) {
-      rd_kafka_conf_destroy(kconf);
-      ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                    "rd_kafka_conf_set failed: %s", errstr);
-      return false;
-    }
-  }
-  if (conf->max_buffer_ms != NGX_CONF_UNSET_MSEC) {
-    snprintf(value, sizeof value, "%zu", conf->max_buffer_ms / 1000);
-    rv = rd_kafka_conf_set(kconf, "queue.buffering.max.ms", value, errstr,
-                           sizeof errstr);
-    if (rv) {
-      rd_kafka_conf_destroy(kconf);
-      ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                    "rd_kafka_conf_set failed: %s", errstr);
-      return false;
-    }
-  }
-  if (conf->batch_size != NGX_CONF_UNSET_SIZE) {
-    snprintf(value, sizeof value, "%zu", conf->batch_size);
-    rv = rd_kafka_conf_set(kconf, "batch.num.messages", value, errstr,
-                           sizeof errstr);
-    if (rv) {
-      rd_kafka_conf_destroy(kconf);
-      ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                    "rd_kafka_conf_set failed: %s", errstr);
-      return false;
-    }
-  }
-  // rd_kafka_conf_set_dr_msg_cb(kconf, msg_delivered);
-  rd_kafka_conf_set_dr_msg_cb(kconf, NULL); // disable the callback for now
-  rd_kafka_conf_set_log_cb(kconf, NULL); // disable logging
-
-  conf->rk = rd_kafka_new(RD_KAFKA_PRODUCER, kconf, errstr, sizeof errstr);
-  if (!conf->rk) {
-    rd_kafka_conf_destroy(kconf); // the producer has not taken ownership
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                  "Failed to create a Kafka producer: %s", errstr);
-    return false;
+  if (mc->confs) {
+    free(mc->confs);
+    mc->confs = NULL;
+    mc->confs_size = 0;
   }
 
-  char brokerlist[conf->brokerlist.len + 1];
-  memcpy(brokerlist, conf->brokerlist.data, conf->brokerlist.len + 1);
-  if (rd_kafka_brokers_add(conf->rk, (const char *)conf->brokerlist.data) == 0) {
-    rd_kafka_destroy(conf->rk);
-    conf->rk = NULL;
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                  "No valid brokers specified");
-    return false;
-  }
-
-  char topic[conf->topic.len + 1];
-  memcpy(topic, conf->topic.data, conf->topic.len + 1);
-  rd_kafka_topic_conf_t *tconf = rd_kafka_topic_conf_new();
-  if (!tconf) {
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                  "rd_kafka_topic_conf_new failed");
-    return false;
-  }
-  conf->rkt = rd_kafka_topic_new(conf->rk, topic, tconf);
-  if (!conf->rkt) {
-    rd_kafka_topic_conf_destroy(tconf);
-    rd_kafka_destroy(conf->rk);
-    conf->rk = NULL;
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                  "Failed to create a Kafka topic: %s", errstr);
-    return false;
-  }
-  rd_kafka_t **ptmp = realloc(mc->producers,
-                              sizeof*ptmp * (mc->producers_size + 1));
-  if (ptmp) {
-    mc->producers = ptmp;
-    mc->producers[mc->producers_size++] = conf->rk;
-  } else {
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                  "producers realloc failed");
-    return false;
-  }
-
-  rd_kafka_topic_t **ttmp = realloc(mc->topics,
-                                    sizeof*ttmp * (mc->topics_size + 1));
-  if (ttmp) {
-    mc->topics = ttmp;
-    mc->topics[mc->topics_size++] = conf->rkt;
-  } else {
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                  "topics realloc failed");
-    return false;
-  }
-  return true;
+  rd_kafka_wait_destroyed(1000);
 }
 
 
@@ -452,6 +561,24 @@ static lsb_err_value write_content_field(lsb_output_buffer *ob,
     }
   }
   return ev;
+}
+
+
+static bool output_framed(lsb_output_buffer *ob, FILE *fh)
+{
+  if (!fh) return false;
+
+  char header[14] = "\x1e\x00\x08"; // up to 10 varint bytes and a \x1f
+  int hlen = lsb_pb_output_varint(header + 3, ob->pos) + 1;
+  header[1] = (char)hlen;
+  header[hlen + 2] = '\x1f';
+  if (fwrite(header, hlen + 3, 1, fh) != 1) {
+    return false;
+  }
+  if (fwrite(ob->buf, ob->pos, 1, fh) != 1) {
+    return false;
+  }
+  return true;
 }
 
 
@@ -534,6 +661,28 @@ ngx_http_moz_ingest_body_handler(ngx_http_request_t *r)
     return;
   }
 
+  if (conf->landfill_dir.len) {
+    landfill_file *lff;
+    if (r->headers_in.host->value.len == conf->landfill_name.len &&
+        ngx_strcasecmp(r->headers_in.host->value.data, conf->landfill_name.data) == 0) {
+      lff = &conf->lfmain;
+    } else {
+      lff = &conf->lfother;
+    }
+    bool output = output_framed(&ob, lff->fh);
+    if (roll_landfill_log(conf, lff)) {
+      if (!open_landfill_log(conf, lff)) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "landfill open failure");
+      }
+    }
+
+    if (!output) {
+      ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "landfill write failure");
+      lsb_free_output_buffer(&ob);
+      ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+      return;
+    }
+  }
   errno = 0;
   int ret = rd_kafka_produce(conf->rkt, RD_KAFKA_PARTITION_UA,
                              RD_KAFKA_MSG_F_FREE,
@@ -585,12 +734,6 @@ ngx_http_moz_ingest_handler(ngx_http_request_t *r)
     return NGX_HTTP_REQUEST_ENTITY_TOO_LARGE;
   }
 
-  if (!conf->rk) {
-    if (!ngx_http_moz_ingest_init_kafka(r, conf)) {
-      return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-  }
-
   ngx_int_t rc =
       ngx_http_read_client_request_body(r, ngx_http_moz_ingest_body_handler);
 
@@ -607,6 +750,22 @@ ngx_http_moz_ingest(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
   ngx_http_core_loc_conf_t *clcf =
       ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
   clcf->handler = ngx_http_moz_ingest_handler;
+
+  ngx_http_moz_ingest_main_conf_t *mc =
+      ngx_http_conf_get_module_main_conf(cf, ngx_http_moz_ingest_module);
+
+  ngx_http_moz_ingest_loc_conf_t *milc =
+      ngx_http_conf_get_module_loc_conf(cf, ngx_http_moz_ingest_module);
+
+  ngx_http_moz_ingest_loc_conf_t **ptmp =
+      realloc(mc->confs, sizeof(*ptmp) * (mc->confs_size + 1));
+  if (ptmp) {
+    mc->confs = ptmp;
+    mc->confs[mc->confs_size++] = milc;
+  } else {
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "confs realloc failed");
+    return NGX_CONF_ERROR;
+  }
 
   /*
   rd_kafka_conf_t *kconf = rd_kafka_conf_new();

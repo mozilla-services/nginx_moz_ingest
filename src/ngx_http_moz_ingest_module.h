@@ -11,20 +11,23 @@
 #include <ngx_core.h>
 #include <nginx.h>
 #include <librdkafka/rdkafka.h>
+#include <stdio.h>
+#include <time.h>
 
 extern ngx_module_t ngx_http_moz_ingest_module;
 
 typedef struct {
-  rd_kafka_t **producers;
-  rd_kafka_topic_t **topics;
-
-  size_t producers_size;
-  size_t topics_size;
-} ngx_http_moz_ingest_main_conf_t;
+  FILE    *fh;
+  time_t  t;
+  int     cnt;
+} landfill_file;
 
 typedef struct {
-  rd_kafka_t                *rk;
-  rd_kafka_topic_t          *rkt;
+  rd_kafka_t        *rk;
+  rd_kafka_topic_t  *rkt;
+
+  landfill_file     lfmain;
+  landfill_file     lfother;
 
   size_t      max_content_size;
   size_t      max_unparsed_uri_size;
@@ -37,7 +40,17 @@ typedef struct {
   size_t      batch_size;
   ngx_str_t   brokerlist;
   ngx_str_t   topic;
+
+  // Landfill settings (alternate S3 load mechanism)
+  size_t      landfill_roll_size;
+  ngx_str_t   landfill_dir;
+  ngx_str_t   landfill_name;
 } ngx_http_moz_ingest_loc_conf_t;
+
+typedef struct {
+  ngx_http_moz_ingest_loc_conf_t **confs;
+  size_t confs_size;
+} ngx_http_moz_ingest_main_conf_t;
 
 #endif /* NGX_HTTP_MOZ_INGEST_MODULE_H */
 
