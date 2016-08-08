@@ -157,9 +157,9 @@ expected `Host` header for the location; if the `Host` header does not match the
 to a file prefixed with `<moz_ingest_landfill_name>_other`.
 
 ##### Landfill File Naming Convention
-`<moz_ingest_landfill_dir>/<moz_ingest_landfill_name>+YYYMMDDHHMMSS.#_<hostname>_<pid>`
+`<moz_ingest_landfill_dir>/<moz_ingest_landfill_name>+YYYMMDD+HHMMSS.#_<hostname>_<pid>`
 
-e.g. /mnt/landfill/incoming.telemetry.mozilla.org+20160807182815.0_ip-172-31-43-254_6485
+e.g. /mnt/landfill/incoming.telemetry.mozilla.org+20160807+182815.0_ip-172-31-43-254_6485
 
     Syntax: moz_ingest_landfill_name string;
     Default: --

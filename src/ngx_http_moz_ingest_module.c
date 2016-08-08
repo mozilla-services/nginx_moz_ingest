@@ -280,7 +280,7 @@ static void get_landfill_name(ngx_http_moz_ingest_loc_conf_t *conf,
   ngx_tm_t tm;
   ngx_gmtime(lff->t, &tm);
   u_char *end = ngx_snprintf((u_char *)buf, len - 1,
-                             "%V/%V%s+%4d%02d%02d%02d%02d%02d.%d_%V_%P",
+                             "%V/%V%s+%4d%02d%02d+%02d%02d%02d.%d_%V_%P",
                              &conf->landfill_dir,
                              &conf->landfill_name,
                              lff == &conf->lfother ? "_other" : "",
