@@ -3,10 +3,12 @@ Mozilla Nginx Data Ingestion
 
 ## Overview
 Nginx module for taking HTTP requests, transforming them into Heka
-protobuf messages and sending them directly to a Kafka cluster.
+protobuf messages and sending them directly to a Kafka cluster. There
+is also a 'landfill' option to write the stream out to disk in addition
+to sending the data to Kafka that can be used as a fail safe.
 
 ### Prerequisites
-* [forked librdkafka](https://github.com/trink/librdkafka/tree/dr_no_poll)
+* [librdkafka](https://github.com/edenhill/librdkafka)
 * [Lua Sandbox](https://github.com/mozilla-services/lua_sandbox)
 
 ### Build Instructions
@@ -45,11 +47,15 @@ http {
         moz_ingest_max_content_size         100k;
         moz_ingest_header                   Content-Length;
         moz_ingest_header                   User-Agent;
+        moz_ingest_landfill_dir             /mnt/landfill;
+        moz_ingest_landfill_roll_size       300M;
 
-        location /telemetry/ {
+
+        location /submit/telemetry/ {
                    keepalive_timeout 0;
                    moz_ingest;
                    moz_ingest_kafka_topic test;
+                   moz_ingest_landfill_name incoming.telemetry.mozilla.org;
         }
     }
 }
@@ -128,3 +134,33 @@ Specifies a header that should be included as message field (if it exists).
     Default: --
     Context: main, http, server, location
 
+#### moz_ingest_landfill_dir
+Specifies the directory the landfill files are written to. If this directive is not set in any
+inherited context or is set to an empty string landfill file creation will be disabled for that
+location.
+
+    Syntax: moz_ingest_landfill_dir string;
+    Default: --
+    Context: main, http, server, location
+
+#### moz_ingest_landfill_roll_size
+Specifies the landfill file size at which the file will be finalized (renamed with a `.done` 
+extension) and a new file created.
+
+    Syntax: moz_ingest_landfill_roll_size size;
+    Default: 300M
+    Context: main, http, server, location
+
+#### moz_ingest_landfill_name
+Specifies the landfill file name prefix (must be unique per location). This name should match the
+expected `Host` header for the location; if the `Host` header does not match the data is written
+to a file prefixed with `<moz_ingest_landfill_name>_other`.
+
+##### Landfill File Naming Convention
+`<moz_ingest_landfill_dir>/<moz_ingest_landfill_name>+YYYMMDD+HHMMSS.#_<hostname>_<pid>`
+
+e.g. /mnt/landfill/incoming.telemetry.mozilla.org+20160807+182815.0_ip-172-31-43-254_6485
+
+    Syntax: moz_ingest_landfill_name string;
+    Default: --
+    Context: location
