@@ -43,6 +43,7 @@ typedef struct {
 
   // Landfill settings (alternate S3 load mechanism)
   size_t      landfill_roll_size;
+  time_t      landfill_roll_timeout;
   ngx_str_t   landfill_dir;
   ngx_str_t   landfill_name;
 } ngx_http_moz_ingest_loc_conf_t;

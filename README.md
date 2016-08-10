@@ -49,6 +49,7 @@ http {
         moz_ingest_header                   User-Agent;
         moz_ingest_landfill_dir             /mnt/landfill;
         moz_ingest_landfill_roll_size       300M;
+        moz_ingest_landfill_roll_timeout    60m;
 
 
         location /submit/telemetry/ {
@@ -149,6 +150,16 @@ extension) and a new file created.
 
     Syntax: moz_ingest_landfill_roll_size size;
     Default: 300M
+    Context: main, http, server, location
+
+#### moz_ingest_landfill_roll_timeout
+Specifies the landfill timeout when the file will be finalized even if it has not
+reached the roll size. This is driven by incoming requests to the location (per process)
+and not by a timer i.e., if a single request is sent to the location the file will never
+be rolled due to a timeout, it will only be finalized on Nginx shutdown.
+
+    Syntax: moz_ingest_landfill_roll_timeout seconds;
+    Default: 60m
     Context: main, http, server, location
 
 #### moz_ingest_landfill_name
