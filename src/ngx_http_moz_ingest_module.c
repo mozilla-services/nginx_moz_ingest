@@ -117,6 +117,13 @@ static ngx_command_t ngx_http_moz_ingest_cmds[] = {
     offsetof(ngx_http_moz_ingest_loc_conf_t, landfill_roll_size),
     NULL },
 
+  { ngx_string("moz_ingest_landfill_roll_timeout"),
+    NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+    ngx_conf_set_sec_slot,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    offsetof(ngx_http_moz_ingest_loc_conf_t, landfill_roll_timeout),
+    NULL },
+
   { ngx_string("moz_ingest_landfill_name"),
     NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
     ngx_conf_set_str_slot,
@@ -182,6 +189,7 @@ static void* ngx_http_moz_ingest_create_loc_conf(ngx_conf_t *cf)
   conf->max_buffer_size       = NGX_CONF_UNSET_SIZE;
   conf->batch_size            = NGX_CONF_UNSET_SIZE;
   conf->landfill_roll_size    = NGX_CONF_UNSET_SIZE;
+  conf->landfill_roll_timeout = NGX_CONF_UNSET;
   conf->max_buffer_ms         = NGX_CONF_UNSET_MSEC;
   // everything else is properly initialized by pcalloc
   return conf;
@@ -208,6 +216,8 @@ ngx_http_moz_ingest_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                             NGX_CONF_UNSET_SIZE);
   ngx_conf_merge_size_value(conf->landfill_roll_size, prev->landfill_roll_size,
                             1024 * 1024 * 300);
+  ngx_conf_merge_sec_value(conf->landfill_roll_timeout, prev->landfill_roll_timeout,
+                            60 * 60);
   ngx_conf_merge_str_value(conf->brokerlist, prev->brokerlist, "");
   ngx_conf_merge_str_value(conf->topic, prev->topic, "");
   ngx_conf_merge_str_value(conf->landfill_dir, prev->landfill_dir, "");
@@ -311,11 +321,14 @@ static bool open_landfill_log(ngx_http_moz_ingest_loc_conf_t *conf, landfill_fil
 }
 
 
-static bool roll_landfill_log(ngx_http_moz_ingest_loc_conf_t *conf, landfill_file *lff)
+static bool roll_landfill_log(ngx_http_moz_ingest_loc_conf_t *conf,
+                              landfill_file *lff,
+                              time_t t)
 {
   if (lff->fh) {
     long len = ftell(lff->fh);
-    if (len >= (long)conf->landfill_roll_size) {
+    if (lff->t + conf->landfill_roll_timeout <= t
+        || len >= (long)conf->landfill_roll_size) {
       fclose(lff->fh);
       lff->fh = NULL;
 
@@ -326,7 +339,7 @@ static bool roll_landfill_log(ngx_http_moz_ingest_loc_conf_t *conf, landfill_fil
         char done[261];
         snprintf(done, sizeof(done), "%s.done", fn);
         rename(fn, done);
-      } else { // clean up empty files on shutdown
+      } else { // clean up empty files
         remove(fn);
       }
       return true;
@@ -461,8 +474,8 @@ static void ngx_http_moz_ingest_exit_process(ngx_cycle_t *cycle)
     }
 
     conf->landfill_roll_size = 0;
-    roll_landfill_log(conf, &conf->lfmain);
-    roll_landfill_log(conf, &conf->lfother);
+    roll_landfill_log(conf, &conf->lfmain, 0);
+    roll_landfill_log(conf, &conf->lfother, 0);
   }
 
   free(mc->confs);
@@ -662,25 +675,33 @@ ngx_http_moz_ingest_body_handler(ngx_http_request_t *r)
   }
 
   if (conf->landfill_dir.len) {
-    landfill_file *lff;
+    landfill_file *lff, *lfa;
     if (r->headers_in.host->value.len == conf->landfill_name.len &&
         ngx_strcasecmp(r->headers_in.host->value.data, conf->landfill_name.data) == 0) {
       lff = &conf->lfmain;
+      lfa = &conf->lfother;
     } else {
       lff = &conf->lfother;
+      lfa = &conf->lfmain;
     }
-    bool output = output_framed(&ob, lff->fh);
-    if (roll_landfill_log(conf, lff)) {
-      if (!open_landfill_log(conf, lff)) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "landfill open failure");
-      }
-    }
-
-    if (!output) {
+    if (!output_framed(&ob, lff->fh) || fflush(lff->fh)) {
       ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "landfill write failure");
       lsb_free_output_buffer(&ob);
       ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
       return;
+    }
+
+    if (roll_landfill_log(conf, lff, r->start_sec)) {
+      if (!open_landfill_log(conf, lff)) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "landfill open failure");
+      }
+    }
+    // check the file not being written to for a roll_timeout
+    if (lfa->t + conf->landfill_roll_timeout <= r->start_sec
+        && roll_landfill_log(conf, lfa, r->start_sec)) {
+      if (!open_landfill_log(conf, lfa)) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "landfill open failure");
+      }
     }
   }
   errno = 0;
@@ -692,12 +713,18 @@ ngx_http_moz_ingest_body_handler(ngx_http_request_t *r)
                             );
   if (ret == -1) {
     lsb_free_output_buffer(&ob);
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                  "kafka produce failure: %d", errno);
-    ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
-    return;
+    if (conf->landfill_dir.len) {
+      ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                    "kafka produce failure: %d (failure ignored since "
+                    "the message is captured in landfill)", errno);
+    } else {
+      ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                    "kafka produce failure: %d", errno);
+      ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+      return;
+    }
   }
-  ob.buf = NULL; // kafka has ownership, don't call lsb_free_output_buffer
+  ob.buf = NULL; // already freed or kafka has ownership
 
   ngx_http_complex_value_t cv;
   ngx_memzero(&cv, sizeof(ngx_http_complex_value_t));
