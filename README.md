@@ -79,7 +79,7 @@ Specifies the Kafka broker list as specified by the
     Default: --
     Context: main, http, server, location
 
-#### moz_ingest_kafka_brokerlist
+#### moz_ingest_kafka_topic
 Specifies the Kafka topic name to send the messages to.
 
         Syntax: moz_ingest_kafka_topic string;
